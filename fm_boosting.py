@@ -230,7 +230,7 @@ flags.DEFINE_integer(
     "total_steps", 400001, help="total training steps"
 )  # Lipman et al uses 400k but double batch size
 flags.DEFINE_integer("warmup", 5000, help="learning rate warmup")
-flags.DEFINE_integer("batch_size", 4, help="batch size")  # Lipman et al uses 128
+flags.DEFINE_integer("batch_size", 8, help="batch size")  # Lipman et al uses 128
 flags.DEFINE_integer("num_workers", 1, help="workers of Dataloader")
 flags.DEFINE_float("ema_decay", 0.9999, help="ema decay rate")
 flags.DEFINE_bool("parallel", False, help="multi gpu training")
@@ -243,8 +243,8 @@ flags.DEFINE_integer(
 )
 
 # remove for actual script
-import sys
-FLAGS(sys.argv)
+# import sys
+# FLAGS(sys.argv)
 
 def warmup_lr(step):
     return min(step, FLAGS.warmup) / FLAGS.warmup
@@ -372,20 +372,23 @@ def train(argv):
             # The conditioning signal x1 (hi_res_latents) remains unchanged
             # the starting point x0 correspoinds to an encoded representation of the image
             # standard flow matching loss
-            # loss = torch.mean((vt - ut) ** 2)
+            loss = torch.mean((vt - ut) ** 2)
             # coupling flow matching loss
-            loss = torch.mean((vt - (x1 - x0)) ** 2)
+            # loss = torch.mean((vt - (x1 - x0)) ** 2) (??)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(net_model.parameters(), FLAGS.grad_clip)  # new
             optim.step()
             sched.step()
             ema(net_model, ema_model, FLAGS.ema_decay)  # new
-            if step % 10 == 0:
+            if step % 1 == 0:
                 print(loss.data.cpu().numpy().tolist())
             # sample and Saving the weights
             if FLAGS.save_step > 0 and step % FLAGS.save_step == 0:
-                generate_samples(net_model, FLAGS.parallel, savedir, step, net_="normal")
-                generate_samples(ema_model, FLAGS.parallel, savedir, step, net_="ema")
+                # TODO: this does not work yet since we only obtain latents
+                # Need an additional decoding step after generating samples.
+                # Needs to be adjusted in generate samples function aswell.
+                # generate_samples(net_model, FLAGS.parallel, savedir, step, net_="normal")
+                # generate_samples(ema_model, FLAGS.parallel, savedir, step, net_="ema")
                 torch.save(
                     {
                         "net_model": net_model.state_dict(),
