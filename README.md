@@ -1,4 +1,4 @@
-# fm_boosting
+# fm_boosting (fan repository)
 Test Implementation of Boosting Latent Diffusion with Flow Matching
 
 
