@@ -1,54 +1,47 @@
-import matplotlib.pyplot as plt
-import torch
-import torch.nn as nn
-
-from sklearn.datasets import make_moons, make_swiss_roll
-from sklearn.preprocessing import StandardScaler
-from torch import Tensor
-from torch.distributions import Normal
-from torch.utils.data import TensorDataset, DataLoader
-from zuko.utils import odeint
-from tqdm import tqdm
-from typing import *
-import numpy as np
-import pandas as pd
-
+"""
+Minimal Proof of Concept Implementation of
+https://arxiv.org/abs/2312.07360
+https://arxiv.org/pdf/2312.07360.pdf
+https://github.com/CompVis/fm-boosting
+This example uses CelebA as an example dataset since we need both 1024x1024 and 256x256 resolution 
+images, and CelebA is available as 1024x1024, allowing us to simply downsample to 256x256 during training.
+"""
 from pathlib import Path
 import os
+import copy
 
-from pathlib import Path
-import nibabel as nib
-
-import cv2
+from absl import app, flags
 from PIL import Image
-from functools import partial
-import json
-
-from typing import Tuple, List
-from beartype.door import is_bearable
-
-import numpy as np
+from einops import rearrange
+from diffusers import StableDiffusionPipeline
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader as PytorchDataLoader
 from torchvision import transforms as T, utils
+from torchdyn.core import NeuralODE
+from tqdm import trange
+from torchvision.utils import make_grid, save_image
 
-from einops import rearrange
+from torchcfm.conditional_flow_matching import (
+    ConditionalFlowMatcher,
+    ExactOptimalTransportConditionalFlowMatcher,
+    TargetConditionalFlowMatcher,
+    VariancePreservingConditionalFlowMatcher,
+)
+from torchcfm.models.unet.unet import UNetModel, UNetModelWrapper
 
-from diffusers import StableDiffusionPipeline
-
+#### Setup
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
 model_id = "runwayml/stable-diffusion-v1-5"
 pipe = StableDiffusionPipeline.from_pretrained(model_id)
 pipe = pipe.to(device)
 
-celeba_path = Path("/dss/dssmcmlfs01/pr74ze/pr74ze-dss-0001/ru25jan4/data/CelebA/celeba/img_align_celeba")
-celeba_path.exists()
+# only need the KL Autoencoder
+vae = pipe.vae
 
-files = os.listdir(celeba_path)
 
+#### Helper Classes
 class ImageDataset(Dataset):
     def __init__(
         self,
@@ -76,33 +69,8 @@ class ImageDataset(Dataset):
         img = Image.open(path)
         return self.transform(img)
 
-# hi_res_ds = ImageDataset(folder=celeba_path, image_size=1024)
 
-# sample = next(iter(hi_res_ds))
-# x = sample.to(device)
-# batch = x.unsqueeze(0)
-
-vae = pipe.vae
-# with torch.no_grad():
-#     hi_res_latent = vae.encode(batch).latent_dist.sample()
-#     hi_res_recon = vae.decode(hi_res_latent).sample
-
-# assert hi_res_recon.shape == batch.shape == torch.Size([1, 3, 1024, 1024])
-# assert hi_res_latent.shape == torch.Size([1, 4, 128, 128])
-
-# lo_res_ds = ImageDataset(folder=celeba_path, image_size=256)
-# sample = next(iter(lo_res_ds))
-# x = sample.to(device)
-# batch = x.unsqueeze(0)
-
-# with torch.no_grad():
-#     lo_res_latent = vae.encode(batch).latent_dist.sample()
-#     lo_res_recon = vae.decode(lo_res_latent).sample
-
-# assert lo_res_recon.shape == batch.shape == torch.Size([1, 3, 256, 256])
-# assert lo_res_latent.shape == torch.Size([1, 4, 32, 32])
-
-from torch.nn import functional as F
+# helperfunction so we can downsample loaded images to 256x256 resolution
 def downsample_2d(X, sz):
     """
     Downsamples a stack of square images.
@@ -125,17 +93,7 @@ def downsample_2d(X, sz):
         X = X = X / mask
     return F.interpolate(X, size=sz, mode='bilinear')
 
-
-#### Flow Matching
-import copy
-import os
-
-import torch
-from absl import app, flags
-from torchdyn.core import NeuralODE
-from torchvision import datasets, transforms
-from tqdm import trange
-
+# helper function that allows us to save exponential moving average of model parameters
 def ema(source, target, decay):
     source_dict = source.state_dict()
     target_dict = target.state_dict()
@@ -143,9 +101,6 @@ def ema(source, target, decay):
         target_dict[key].data.copy_(
             target_dict[key].data * decay + source_dict[key].data * (1 - decay)
         )
-
-from torchdyn.core import NeuralODE
-from torchvision.utils import make_grid, save_image
 
 
 def generate_samples(model, parallel, savedir, step, net_="normal"):
@@ -183,88 +138,86 @@ def infiniteloop(dataloader):
         for x in iter(dataloader):
             yield x
 
-from torchcfm.conditional_flow_matching import (
-    ConditionalFlowMatcher,
-    ExactOptimalTransportConditionalFlowMatcher,
-    TargetConditionalFlowMatcher,
-    VariancePreservingConditionalFlowMatcher,
-)
-from torchcfm.models.unet.unet import UNetModelWrapper, UNetModel
-
 # define slightly other wrapper since we need a specific number of output channels so we can 
 # concatenate noise to the upsampled low dim latents and obtain a 1:1 mapping to the high res latents
-NUM_CLASSES = 1000
+# NUM_CLASSES = 1000
 
-class UNetModelWrapper(UNetModel):
-    def __init__(
-        self,
-        dim,
-        num_channels,
-        num_res_blocks,
-        channel_mult=None,
-        learn_sigma=False,
-        class_cond=False,
-        num_classes=NUM_CLASSES,
-        use_checkpoint=False,
-        attention_resolutions="16",
-        num_heads=1,
-        num_head_channels=-1,
-        num_heads_upsample=-1,
-        use_scale_shift_norm=False,
-        dropout=0,
-        resblock_updown=False,
-        use_fp16=False,
-        use_new_attention_order=False,
-    ):
-        """Dim (tuple): (C, H, W)"""
-        image_size = dim[-1]
-        if channel_mult is None:
-            if image_size == 512:
-                channel_mult = (0.5, 1, 1, 2, 2, 4, 4)
-            elif image_size == 256:
-                channel_mult = (1, 1, 2, 2, 4, 4)
-            elif image_size == 128:
-                channel_mult = (1, 1, 2, 3, 4)
-            elif image_size == 64:
-                channel_mult = (1, 2, 3, 4)
-            elif image_size == 32:
-                channel_mult = (1, 2, 2, 2)
-            elif image_size == 28:
-                channel_mult = (1, 2, 2)
-            else:
-                raise ValueError(f"unsupported image size: {image_size}")
-        else:
-            channel_mult = list(channel_mult)
-        attention_ds = []
-        for res in attention_resolutions.split(","):
-            attention_ds.append(image_size // int(res))
-        return super().__init__(
-            image_size=image_size,
-            in_channels=dim[0],
-            model_channels=num_channels,
-            # need to hardcode out_channels as dim[0] / 2 since we map from 
-            # (b, 8, 128, 128) to (b, 4, 128, 128)
-            out_channels=4,
-            num_res_blocks=num_res_blocks,
-            attention_resolutions=tuple(attention_ds),
-            dropout=dropout,
-            channel_mult=channel_mult,
-            num_classes=(num_classes if class_cond else None),
-            use_checkpoint=use_checkpoint,
-            use_fp16=use_fp16,
-            num_heads=num_heads,
-            num_head_channels=num_head_channels,
-            num_heads_upsample=num_heads_upsample,
-            use_scale_shift_norm=use_scale_shift_norm,
-            resblock_updown=resblock_updown,
-            use_new_attention_order=use_new_attention_order,
-        )
-    def forward(self, t, x, y=None, *args, **kwargs):
-        return super().forward(t, x, y=y)
+# class UNetModelWrapper(UNetModel):
+#     def __init__(
+#         self,
+#         dim,
+#         num_channels,
+#         num_res_blocks,
+#         channel_mult=None,
+#         learn_sigma=False,
+#         class_cond=False,
+#         num_classes=NUM_CLASSES,
+#         use_checkpoint=False,
+#         attention_resolutions="16",
+#         num_heads=1,
+#         num_head_channels=-1,
+#         num_heads_upsample=-1,
+#         use_scale_shift_norm=False,
+#         dropout=0,
+#         resblock_updown=False,
+#         use_fp16=False,
+#         use_new_attention_order=False,
+#     ):
+#         """Dim (tuple): (C, H, W)"""
+#         image_size = dim[-1]
+#         if channel_mult is None:
+#             if image_size == 512:
+#                 channel_mult = (0.5, 1, 1, 2, 2, 4, 4)
+#             elif image_size == 256:
+#                 channel_mult = (1, 1, 2, 2, 4, 4)
+#             elif image_size == 128:
+#                 channel_mult = (1, 1, 2, 3, 4)
+#             elif image_size == 64:
+#                 channel_mult = (1, 2, 3, 4)
+#             elif image_size == 32:
+#                 channel_mult = (1, 2, 2, 2)
+#             elif image_size == 28:
+#                 channel_mult = (1, 2, 2)
+#             else:
+#                 raise ValueError(f"unsupported image size: {image_size}")
+#         else:
+#             channel_mult = list(channel_mult)
+#         attention_ds = []
+#         for res in attention_resolutions.split(","):
+#             attention_ds.append(image_size // int(res))
+#         return super().__init__(
+#             image_size=image_size,
+#             in_channels=dim[0],
+#             model_channels=num_channels,
+#             # need to hardcode out_channels as dim[0] / 2 since we map from 
+#             # (b, 8, 128, 128) to (b, 4, 128, 128)
+#             out_channels=4,
+#             num_res_blocks=num_res_blocks,
+#             attention_resolutions=tuple(attention_ds),
+#             dropout=dropout,
+#             channel_mult=channel_mult,
+#             num_classes=(num_classes if class_cond else None),
+#             use_checkpoint=use_checkpoint,
+#             use_fp16=use_fp16,
+#             num_heads=num_heads,
+#             num_head_channels=num_head_channels,
+#             num_heads_upsample=num_heads_upsample,
+#             use_scale_shift_norm=use_scale_shift_norm,
+#             resblock_updown=resblock_updown,
+#             use_new_attention_order=use_new_attention_order,
+#         )
+#     def forward(self, t, x, y=None, *args, **kwargs):
+#         return super().forward(t, x, y=y)
+
+
+
+
+#### Flow Matching
 
 
 FLAGS = flags.FLAGS
 
+flags.DEFINE_string("data_path", "/dss/dssmcmlfs01/pr74ze/pr74ze-dss-0001/ru25jan4/data/CelebA/celeba/img_align_celeba", help="path to CelebA directory")
 flags.DEFINE_string("model", "otcfm", help="flow matching model type")
 flags.DEFINE_string("output_dir", "./ot_cfm_results/", help="output_directory")
 # UNet
@@ -293,10 +246,6 @@ flags.DEFINE_integer(
 import sys
 FLAGS(sys.argv)
 
-use_cuda = torch.cuda.is_available()
-device = torch.device("cuda" if use_cuda else "cpu")
-
-
 def warmup_lr(step):
     return min(step, FLAGS.warmup) / FLAGS.warmup
 
@@ -311,9 +260,10 @@ def train(argv):
     )
 
     # DATASETS/DATALOADER
+    celeba_path = Path(FLAGS.data_path)
+    assert celeba_path.exists()
     dataset = ImageDataset(folder=celeba_path, image_size=1024)
 
-    
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=FLAGS.batch_size,
@@ -323,20 +273,14 @@ def train(argv):
     )
 
     datalooper = infiniteloop(dataloader)
-    # hi_res_latent_shape: torch.Size([1, 4, 128, 128])
-    # lo_res_latent_shape: torch.Size([1, 4, 32, 32])
-    # we naively upsample the low res latent to 4x128x128
-    # then add noise to this
-    # then perform flow matching from noised latent to original latent
-    # then decode the flow matched latent with the vae decoder
-
+    
 
     # MODELS
     net_model = UNetModelWrapper(
-        dim=(8, 128, 128), # must match channel, h, w of hi res latent
+        dim=(4, 128, 128), # must match channel, h, w of hi res latent
         num_res_blocks=3,               # assuming this is "Depth" in table 8 https://arxiv.org/pdf/2312.07360.pdf#table.caption.28
         num_channels=FLAGS.num_channel, # 128 like in table 8
-    channel_mult=[1, 2, 3, 4],      # channel mult from table 8 FacesHQ
+        channel_mult=[1, 2, 3, 4],      # channel mult from table 8 FacesHQ
         num_heads=4,                # Number of Heads table 8
         num_head_channels=64,       # Head channels table 8
         attention_resolutions="16", # Attention resolutions also table 8
@@ -390,6 +334,12 @@ def train(argv):
             with torch.no_grad():
                 hi_res_latents = vae.encode(hi_res_images).latent_dist.sample()
                 lo_res_latents = vae.encode(lo_res_images).latent_dist.sample()
+            # hi_res_latent_shape: torch.Size([1, 4, 128, 128])
+            # lo_res_latent_shape: torch.Size([1, 4, 32, 32])
+            # we naively upsample the low res latent to 4x128x128
+            # then add noise to this
+            # then perform flow matching from noised latent to original latent
+            # then decode the flow matched latent with the vae decoder
             # naively upsample the low resolution latents
             with torch.no_grad():
                 # output size must match last 2 spatial dimensions of hi res latents
@@ -412,7 +362,7 @@ def train(argv):
             # source
             x0 = bilinear_latents + noise
             
-            
+
             t, xt, ut = FM.sample_location_and_conditional_flow(x0, x1)
             # xt = samples drawn from probability path pxt at time t
             # ut = conditional vector field 
@@ -444,7 +394,7 @@ def train(argv):
                         "optim": optim.state_dict(),
                         "step": step,
                     },
-                    savedir + f"{FLAGS.model}_cifar10_weights_step_{step}.pt",
+                    savedir + f"{FLAGS.model}_celeba_weights_step_{step}.pt",
                 )
 
 
