@@ -1,6 +1,6 @@
 # fm_boosting (fan repository)
 Test Implementation of Boosting Latent Diffusion with Flow Matching
-Please raise issues if you have ideas on how to improve the code, I tried to follow the paper as best as I could but the noise concatenation step still confuses me since it means the tensors will mismatch and thus we will no longer be able to perform flow matching. I solved this by just adding the noise to the source tensor instead of concatenating, but I suspect this may cause the code to malfuction. 
+Please raise issues if you have ideas on how to improve the code, I tried to follow the paper as best as I could but the noise concatenation step still confuses me since it means the tensors will mismatch and thus we will no longer be able to perform flow matching. I solved this by just adding the noise to the source tensor instead of concatenating, but I suspect this may cause the code to perform not quite as good as mixing noise directly with a specialized UNet. 
 
 Reference Implementation by Bene Arnthof. Please raise issues and pull requests I will wrap this code in a nice package in the coming days. For now enjoy this minimal example that trains on CelebA. Tested on a 40GB A100, very slow on one card with batch size of 8.
 
