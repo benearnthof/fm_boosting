@@ -58,7 +58,7 @@ class ImageDataset(Dataset):
         self.transform = T.Compose([
             T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
             T.Resize(image_size),
-            #T.RandomHorizontalFlip(),
+            #T.RandomHorizontalFlip(), # no augmentation
             T.CenterCrop(image_size),
             T.ToTensor()
         ])
@@ -138,8 +138,83 @@ def infiniteloop(dataloader):
         for x in iter(dataloader):
             yield x
 
+# define slightly other wrapper since we need a specific number of output channels so we can 
+# concatenate noise to the upsampled low dim latents and obtain a 1:1 mapping to the high res latents
+NUM_CLASSES = 1000
+
+class UNetModelWrapper(UNetModel):
+    def __init__(
+        self,
+        dim,
+        num_channels,
+        num_res_blocks,
+        channel_mult=None,
+        learn_sigma=False,
+        class_cond=False,
+        num_classes=NUM_CLASSES,
+        use_checkpoint=False,
+        attention_resolutions="16",
+        num_heads=1,
+        num_head_channels=-1,
+        num_heads_upsample=-1,
+        use_scale_shift_norm=False,
+        dropout=0,
+        resblock_updown=False,
+        use_fp16=False,
+        use_new_attention_order=False,
+    ):
+        """Dim (tuple): (C, H, W)"""
+        image_size = dim[-1]
+        if channel_mult is None:
+            if image_size == 512:
+                channel_mult = (0.5, 1, 1, 2, 2, 4, 4)
+            elif image_size == 256:
+                channel_mult = (1, 1, 2, 2, 4, 4)
+            elif image_size == 128:
+                channel_mult = (1, 1, 2, 3, 4)
+            elif image_size == 64:
+                channel_mult = (1, 2, 3, 4)
+            elif image_size == 32:
+                channel_mult = (1, 2, 2, 2)
+            elif image_size == 28:
+                channel_mult = (1, 2, 2)
+            else:
+                raise ValueError(f"unsupported image size: {image_size}")
+        else:
+            channel_mult = list(channel_mult)
+        attention_ds = []
+        for res in attention_resolutions.split(","):
+            attention_ds.append(image_size // int(res))
+        return super().__init__(
+            image_size=image_size,
+            in_channels=dim[0],
+            model_channels=num_channels,
+            # need to hardcode out_channels as dim[0] / 2 since we map from 
+            # (b, 8, 128, 128) to (b, 4, 128, 128)
+            out_channels=4,
+            num_res_blocks=num_res_blocks,
+            attention_resolutions=tuple(attention_ds),
+            dropout=dropout,
+            channel_mult=channel_mult,
+            num_classes=(num_classes if class_cond else None),
+            use_checkpoint=use_checkpoint,
+            use_fp16=use_fp16,
+            num_heads=num_heads,
+            num_head_channels=num_head_channels,
+            num_heads_upsample=num_heads_upsample,
+            use_scale_shift_norm=use_scale_shift_norm,
+            resblock_updown=resblock_updown,
+            use_new_attention_order=use_new_attention_order,
+        )
+    def forward(self, t, x, y=None, *args, **kwargs):
+        return super().forward(t, x, y=y)
+
+
+
 
 #### Flow Matching
+
+
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string("data_path", "/dss/dssmcmlfs01/pr74ze/pr74ze-dss-0001/ru25jan4/data/CelebA/celeba/img_align_celeba", help="path to CelebA directory")
@@ -156,14 +231,14 @@ flags.DEFINE_integer(
 )  # Lipman et al uses 400k but double batch size
 flags.DEFINE_integer("warmup", 5000, help="learning rate warmup")
 flags.DEFINE_integer("batch_size", 8, help="batch size")  # Lipman et al uses 128
-flags.DEFINE_integer("num_workers", 1, help="workers of Dataloader")
+flags.DEFINE_integer("num_workers", 4, help="workers of Dataloader")
 flags.DEFINE_float("ema_decay", 0.9999, help="ema decay rate")
-flags.DEFINE_bool("parallel", False, help="multi gpu training")
+flags.DEFINE_bool("parallel", True, help="multi gpu training")
 
 # Evaluation
 flags.DEFINE_integer(
     "save_step",
-    5000,
+    10000,
     help="frequency of saving checkpoints, 0 to disable during training",
 )
 
@@ -268,45 +343,96 @@ def train(argv):
             # naively upsample the low resolution latents
             with torch.no_grad():
                 # output size must match last 2 spatial dimensions of hi res latents
-                bilinear_latents = F.interpolate(lo_res_latents, size=hi_res_latents.shape[-2:])
+                bilinear_latents = F.interpolate(lo_res_latents, size=hi_res_latents.shape[-2:], mode="nearest")
             # concatenate noise to bilinear latents
-            # TODO: Do this according to cosine schedule 3.2.3 Noise Augmentation in paper
             # TODO: Here I just add noise to the tensor since it would lead to a shape mismatch 
             # during sampling location and conditional flow.
             # TODO: Need reference implementation for this since this shape mismatch is also 
             # present in figure 3 but is not explained.
+            # Noise Augmentation 
+            # https://arxiv.org/abs/2210.02303
+            # https://arxiv.org/abs/2205.11487
+            # https://github.com/CompVis/fm-boosting/issues/
+            # TODO: investigate impact of noise scale
+            # calculate stds with cosine schedule: 
+            # sample t first
+            t, xt, ut = FM.sample_location_and_conditional_flow(bilinear_latents, hi_res_latents)
+            augment_means = torch.zeros_like(bilinear_latents)
+            stds = 1 - torch.cos((t + 0.008) / 1.008 * torch.pi / 2) ** 2
+            std_helper = []
+            for std in stds:
+                std_helper.append(torch.full_like(torch.Tensor(augment_means.shape[1:]), std))
+            std_tensors = torch.stack(std_helper).cuda()
+            augment_noise = torch.normal(augment_means, std=std_tensors)
             # I will just add some noise with the minimum sigma as mentioned in section 8
             # 1e-4
-            means = torch.zeros_like(bilinear_latents)
-            noise = torch.normal(means, std=1e-4)
+            # TODO: Do this according to cosine schedule 3.2.3 Noise Augmentation in paper
+            # cosine schedule: sample t first
+            # t = torch.rand(1).cuda()
+            # import math
+            # std = 1 - math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2
+            # means = torch.zeros_like(bilinear_latents)
+            # noise = torch.normal(means, std=std)
             # noise = torch.randn_like(bilinear_latents, )
             #### Now we can do the actual flow matching
             # now we obtain our x1 by just concatenating noise like they did in the paper
             # target
             x1 = hi_res_latents
             # source
-            x0 = bilinear_latents + noise
+            x0 = bilinear_latents + augment_noise
             
+            # TODO: There has to be a better way of doing this, a custom net? Idk how the authors do it
+            # The main thing i dont get is the fact that the shapes need to match since the flow matching samples are drawn before
+            # we pass the inputs through the unet, but the authors say they use a custom unet that takes these shapes as inputs
+            # so at which time do they perform the flow matching step? 
+            # m1 = torch.nn.Conv3d(8, 4, kernel_size=(3, 1, 1)).cuda()
+            # m2 = torch.nn.Conv3d(4, 4, kernel_size=(3, 1, 1)).cuda()
+            # out = m1(x0)
+            # out = m2(out)
+            # x0 = out
+            # out.shape
 
-            t, xt, ut = FM.sample_location_and_conditional_flow(x0, x1)
+            # let x1 denote a high resolution data sample
+            # the conditioning signal z := x1 remains unchanged from the previous formulation
+            # the starting point x0 = Encoder(x1) corresponds to an encoded representation of the image
+            # ut = x1 - x0
+            t_helper = []
+            for ti in t:
+                t_helper.append(torch.full_like(x1[1], ti))
+            t_tensors = torch.stack(t_helper).cuda()
+            # batch wise linear interpolation with t values
+            xt = (t_tensors * x1) + ((1-t_tensors) * x0)
+            # cfm loss: unet(t, xt) - (x1 - x0)
+
+            
             # xt = samples drawn from probability path pxt at time t
             # ut = conditional vector field 
+            # concat noise
+            xt_concat = torch.cat((xt, torch.randn_like(xt)), dim=1)
+            # map to target shape
             vt = net_model(t, xt)
+
+            # we perform flow matching sampling first to get xt, t and ut
+            # then we concat noise to xt to get the expressive power of flow matching from distributions? 
+            # then we pass xt_concat through the unet and do regular flow matching
+
+
             # Training objective in the paper: 
             # L2 loss of (net(t, xt) - x1-x0)
             # The conditioning signal x1 (hi_res_latents) remains unchanged
             # the starting point x0 correspoinds to an encoded representation of the image
             # standard flow matching loss
-            loss = torch.mean((vt - ut) ** 2)
+            # loss = torch.mean((vt - ut) ** 2)
             # coupling flow matching loss
-            # loss = torch.mean((vt - (x1 - x0)) ** 2) (??)
+            loss = torch.mean((vt - (x1 - x0)) ** 2) #(??)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(net_model.parameters(), FLAGS.grad_clip)  # new
             optim.step()
             sched.step()
             ema(net_model, ema_model, FLAGS.ema_decay)  # new
-            if step % 1 == 0:
-                print(loss.data.cpu().numpy().tolist())
+            print(loss.data.cpu().numpy().tolist())
+            # if step % 1 == 0:
+            #     print(loss.data.cpu().numpy().tolist())
             # sample and Saving the weights
             if FLAGS.save_step > 0 and step % FLAGS.save_step == 0:
                 # TODO: this does not work yet since we only obtain latents
