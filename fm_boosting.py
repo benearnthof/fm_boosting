@@ -5,323 +5,354 @@ https://arxiv.org/pdf/2312.07360.pdf
 https://github.com/CompVis/fm-boosting
 This example uses CelebA as an example dataset since we need both 1024x1024 and 256x256 resolution 
 images, and CelebA is available as 1024x1024, allowing us to simply downsample to 256x256 during training.
+# UPDATE: Use simpler conditioning routine like in Flow Matching in Latent Space: https://arxiv.org/pdf/2307.08698
 """
-from pathlib import Path
+import argparse
 import os
-import copy
-
-from absl import app, flags
-from PIL import Image
-from einops import rearrange
-from diffusers import StableDiffusionPipeline
+import shutil
 
 import torch
+import torch.distributed as dist
+import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader as PytorchDataLoader
-from torchvision import transforms as T, utils
-from torchdyn.core import NeuralODE
-from tqdm import trange
-from torchvision.utils import make_grid, save_image
-
-from torchcfm.conditional_flow_matching import (
-    ConditionalFlowMatcher,
-    ExactOptimalTransportConditionalFlowMatcher,
-    TargetConditionalFlowMatcher,
-    VariancePreservingConditionalFlowMatcher,
-)
-from torchcfm.models.unet.unet import UNetModel, UNetModelWrapper
-
-from imagen_pytorch import Unet
-
-#### Setup
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-model_id = "runwayml/stable-diffusion-v1-5"
-pipe = StableDiffusionPipeline.from_pretrained(model_id)
-pipe = pipe.to(device)
-
-# only need the KL Autoencoder
-vae = pipe.vae
+import torch.optim as optim
+import torchvision
+from datasets_prep import get_superres_dataset
+from models import get_flow_model
+from omegaconf import OmegaConf
+from torch.multiprocessing import Process
+from torchdiffeq import odeint_adjoint as odeint
 
 
-#### Helper Classes
-class ImageDataset(Dataset):
-    def __init__(
-        self,
-        folder,
-        image_size,
-        exts = ['jpg', 'jpeg', 'png']
-    ):
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+
+def copy_source(file, output_dir):
+    shutil.copyfile(file, os.path.join(output_dir, os.path.basename(file)))
+
+
+def get_weight(model):
+    param_size = 0
+    for param in model.parameters():
+        param_size += param.nelement() * param.element_size()
+    buffer_size = 0
+    for buffer in model.buffers():
+        buffer_size += buffer.nelement() * buffer.element_size()
+    size_all_mb = (param_size + buffer_size) / 1024**2
+    return size_all_mb
+
+
+class WrapperCondFlow(nn.Module):
+    def __init__(self, model, cond) -> None:
         super().__init__()
-        self.folder = folder
-        self.image_size = image_size
-        self.paths = []
-        self.paths = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
-        print(f'{len(self.paths)} training samples found at {folder}')
-        self.transform = T.Compose([
-            T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
-            T.Resize(image_size),
-            #T.RandomHorizontalFlip(), # no augmentation
-            T.CenterCrop(image_size),
-            T.ToTensor()
-        ])
-    def __len__(self):
-        return len(self.paths)
-    def __getitem__(self, index):
-        path = self.paths[index]
-        img = Image.open(path)
-        return self.transform(img)
+        self.model = model
+        self.cond = cond
+    def forward(self, t, x):
+        x = torch.cat([x, self.cond], 1)
+        return self.model(t, x)
 
 
-# helperfunction so we can downsample loaded images to 256x256 resolution
-def downsample_2d(X, sz):
-    """
-    Downsamples a stack of square images.
-    Args:
-        X: a stack of images (batch, channels, ny, ny).
-        sz: the desired size of images.
-    Returns:
-        The downsampled images, a tensor of shape (batch, channel, sz, sz)
-    """
-    kernel = torch.tensor([[.25, .5, .25], 
-                           [.5, 1, .5], 
-                           [.25, .5, .25]], device=X.device).reshape(1, 1, 3, 3)
-    kernel = kernel.repeat((X.shape[1], 1, 1, 1))
-    while sz < X.shape[-1] / 2:
-        # Downsample by a factor 2 with smoothing
-        mask = torch.ones(1, *X.shape[1:])
-        mask = F.conv2d(mask, kernel, groups=X.shape[1], stride=2, padding=1)
-        X = F.conv2d(X, kernel, groups=X.shape[1], stride=2, padding=1)
-        # Normalize the edges and corners.
-        X = X = X / mask
-    return F.interpolate(X, size=sz, mode='bilinear')
-
-# helper function that allows us to save exponential moving average of model parameters
-def ema(source, target, decay):
-    source_dict = source.state_dict()
-    target_dict = target.state_dict()
-    for key in source_dict.keys():
-        target_dict[key].data.copy_(
-            target_dict[key].data * decay + source_dict[key].data * (1 - decay)
-        )
+def broadcast_params(params):
+    for param in params:
+        dist.broadcast(param.data, src=0)
 
 
-def generate_samples(model, parallel, savedir, step, net_="normal"):
-    """Save 64 generated images (8 x 8) for sanity check along training.
-    Parameters
-    ----------
-    model:
-        represents the neural network that we want to generate samples from
-    parallel: bool
-        represents the parallel training flag. Torchdyn only runs on 1 GPU, we need to send the models from several GPUs to 1 GPU.
-    savedir: str
-        represents the path where we want to save the generated images
-    step: int
-        represents the current step of training
-    """
-    model.eval()
-    model_ = copy.deepcopy(model)
-    if parallel:
-        # Send the models from GPU to CPU for inference with NeuralODE from Torchdyn
-        model_ = model_.module.to(device)
-    node_ = NeuralODE(model_, solver="euler", sensitivity="adjoint")
-    with torch.no_grad():
-        traj = node_.trajectory(
-            torch.randn(64, 3, 32, 32, device=device),
-            t_span=torch.linspace(0, 1, 100, device=device),
-        )
-        traj = traj[-1, :].view([-1, 3, 32, 32]).clip(-1, 1)
-        traj = traj / 2 + 0.5
-    save_image(traj, savedir + f"{net_}_generated_FM_images_step_{step}.png", nrow=8)
-    model.train()
+def sample_from_model(model, z_0):
+    # how to pass the cond
+    t = torch.tensor([1.0, 0.0], device="cuda")
+    fake_image = odeint(model, z_0, t, atol=1e-8, rtol=1e-8)
+    return fake_image
 
 
-def infiniteloop(dataloader):
-    while True:
-        for x in iter(dataloader):
-            yield x
+# %%
+def train(rank, gpu, args):
+    from diffusers.models import AutoencoderKL
+    from EMA import EMA
 
-# define slightly other wrapper since we need a specific number of output channels so we can 
-# concatenate noise to the upsampled low dim latents and obtain a 1:1 mapping to the high res latents
+    torch.manual_seed(args.seed + rank)
+    torch.cuda.manual_seed(args.seed + rank)
+    torch.cuda.manual_seed_all(args.seed + rank)
+    device = torch.device("cuda:{}".format(gpu))
 
+    batch_size = args.batch_size
 
-#### Flow Matching
-
-
-FLAGS = flags.FLAGS
-
-flags.DEFINE_string("data_path", "/dss/dssmcmlfs01/pr74ze/pr74ze-dss-0001/ru25jan4/data/CelebA/celeba/img_align_celeba", help="path to CelebA directory")
-flags.DEFINE_string("model", "otcfm", help="flow matching model type")
-flags.DEFINE_string("output_dir", "./ot_cfm_results/", help="output_directory")
-# UNet
-flags.DEFINE_integer("num_channel", 128, help="base channel of UNet")
-
-# Training
-flags.DEFINE_float("lr", 2e-4, help="target learning rate")  # TRY 2e-4
-flags.DEFINE_float("grad_clip", 1.0, help="gradient norm clipping")
-flags.DEFINE_integer(
-    "total_steps", 400001, help="total training steps"
-)  # Lipman et al uses 400k but double batch size
-flags.DEFINE_integer("warmup", 5000, help="learning rate warmup")
-flags.DEFINE_integer("batch_size", 8, help="batch size")  # Lipman et al uses 128
-flags.DEFINE_integer("num_workers", 4, help="workers of Dataloader")
-flags.DEFINE_float("ema_decay", 0.9999, help="ema decay rate")
-flags.DEFINE_bool("parallel", True, help="multi gpu training")
-
-# Evaluation
-flags.DEFINE_integer(
-    "save_step",
-    10000,
-    help="frequency of saving checkpoints, 0 to disable during training",
-)
-
-# remove for actual script
-# import sys
-# FLAGS(sys.argv)
-
-def warmup_lr(step):
-    return min(step, FLAGS.warmup) / FLAGS.warmup
-
-
-def train(argv):
-    print(
-        "lr, total_steps, ema decay, save_step:",
-        FLAGS.lr,
-        FLAGS.total_steps,
-        FLAGS.ema_decay,
-        FLAGS.save_step,
-    )
-
-    # DATASETS/DATALOADER
-    celeba_path = Path(FLAGS.data_path)
-    assert celeba_path.exists()
-    dataset = ImageDataset(folder=celeba_path, image_size=256)
-
-    dataloader = torch.utils.data.DataLoader(
+    dataset = get_superres_dataset(args)
+    train_sampler = torch.utils.data.distributed.DistributedSampler(dataset, num_replicas=1, rank=rank)
+    data_loader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=FLAGS.batch_size,
-        shuffle=True,
-        num_workers=FLAGS.num_workers,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        sampler=train_sampler,
         drop_last=True,
     )
 
-    datalooper = infiniteloop(dataloader)
-    
+    args.layout = False
+    model = get_flow_model(args).to(device)
+    first_stage_model = AutoencoderKL.from_pretrained(args.pretrained_autoencoder_ckpt, cache_dir="/dss/dssmcmlfs01/pr74ze/pr74ze-dss-0001/ru25jan4/data/cache_dir").to(device)
+    # TODO: specify cache_dir as argument
 
-    # MODELS
-    # net_model = UNetModelWrapper(
-    #     dim=(4, 128, 128), # must match channel, h, w of hi res latent
-    #     num_res_blocks=3,               # assuming this is "Depth" in table 8 https://arxiv.org/pdf/2312.07360.pdf#table.caption.28
-    #     num_classes=1024,               # 4*16*16 for upsampling from 128 to 256
-    #     class_cond=True,
-    #     num_channels=FLAGS.num_channel, # 128 like in table 8
-    #     channel_mult=[1, 2, 3, 4],      # channel mult from table 8 FacesHQ
-    #     num_heads=4,                # Number of Heads table 8
-    #     num_head_channels=64,       # Head channels table 8
-    #     attention_resolutions="16", # Attention resolutions also table 8
-    #     dropout=0.1,                # added dropout for a bit of regularization
-    # ).to(
-    #     device
-    # )  # new dropout + bs of 128
-    
-    # new unet for conditional modeling of low res latents
-    net_model = Unet(
-        dim = 128,
-        channels=4,
-        cond_images_channels = 4,
-        dim_mults = (1, 2, 4, 8),
-        num_resnet_blocks = (2, 4, 8, 8),
-        layer_attns = (False, False, False, True),
-        layer_cross_attns = (False, False, False, True)
-    ).to(device)
+    first_stage_model = first_stage_model.eval()
+    first_stage_model.train = False
+    for param in first_stage_model.parameters():
+        param.requires_grad = False
 
-    ema_model = copy.deepcopy(net_model)
-    optim = torch.optim.Adam(net_model.parameters(), lr=FLAGS.lr)
-    sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_lr)
-    if FLAGS.parallel:
-        print(
-            "Warning: parallel training is performing slightly worse than single GPU training due to statistics computation in dataparallel. We recommend to train over a single GPU, which requires around 8 Gb of GPU memory."
-        )
-        net_model = torch.nn.DataParallel(net_model)
-        ema_model = torch.nn.DataParallel(ema_model)
+    print("AutoKL size: {:.3f}MB".format(get_weight(first_stage_model)))
+    print("FM size: {:.3f}MB".format(get_weight(model)))
 
-    # show model size
-    model_size = 0
-    for param in net_model.parameters():
-        model_size += param.data.nelement()
-    print("Model params: %.2f M" % (model_size / 1024 / 1024))
+    # TODO: check if this works with distributed training and add it
+    # broadcast_params(model.parameters())
 
-    #################################
-    #            OT-CFM
-    #################################
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
 
-    sigma = 0.0
-    if FLAGS.model == "otcfm":
-        FM = ExactOptimalTransportConditionalFlowMatcher(sigma=sigma)
-    elif FLAGS.model == "icfm":
-        FM = ConditionalFlowMatcher(sigma=sigma)
-    elif FLAGS.model == "fm":
-        FM = TargetConditionalFlowMatcher(sigma=sigma)
-    elif FLAGS.model == "si":
-        FM = VariancePreservingConditionalFlowMatcher(sigma=sigma)
+    if args.use_ema:
+        optimizer = EMA(optimizer, ema_decay=args.ema_decay)
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.num_epoch, eta_min=1e-5)
+
+    # TODO: ddp
+    # model = nn.parallel.DistributedDataParallel(model, device_ids=[gpu], find_unused_parameters=False)
+
+    exp = args.exp
+    parent_dir = "/dss/dssmcmlfs01/pr74ze/pr74ze-dss-0001/ru25jan4/data/latent_flow_superres{}".format(args.dataset)
+
+    exp_path = os.path.join(parent_dir, exp)
+    if rank == 0:
+        if not os.path.exists(exp_path):
+            os.makedirs(exp_path)
+            config_dict = vars(args)
+            OmegaConf.save(config_dict, os.path.join(exp_path, "config.yaml"))
+
+    if args.resume:
+        checkpoint_file = os.path.join(exp_path, "content.pth")
+        checkpoint = torch.load(checkpoint_file, map_location=device)
+        init_epoch = checkpoint["epoch"]
+        epoch = init_epoch
+        model.load_state_dict(checkpoint["model_dict"])
+        # load G
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        scheduler.load_state_dict(checkpoint["scheduler"])
+        global_step = checkpoint["global_step"]
+        print("=> loaded checkpoint (epoch {})".format(checkpoint["epoch"]))
+        del checkpoint
     else:
-        raise NotImplementedError(
-            f"Unknown model {FLAGS.model}, must be one of ['otcfm', 'icfm', 'fm', 'si']"
-        )
+        global_step, epoch, init_epoch = 0, 0, 0
 
-    savedir = FLAGS.output_dir + FLAGS.model + "/"
-    os.makedirs(savedir, exist_ok=True)
-
-    with trange(FLAGS.total_steps, dynamic_ncols=True) as pbar:
-        for step in pbar:
-            optim.zero_grad()
-            hi_res_images = next(datalooper).to(device)
-            lo_res_images = downsample_2d(hi_res_images.cpu(), sz=128).to(device)
+    for epoch in range(init_epoch, args.num_epoch + 1):
+        train_sampler.set_epoch(epoch)
+        for iteration, (lowres, hires) in enumerate(data_loader):
+            # x_1 = image = target = hires
+            x_1 = hires.to(device, non_blocking=True)
+            cond = lowres.to(device, non_blocking=True)
+            model.zero_grad()
             with torch.no_grad():
-                hi_res_latents = vae.encode(hi_res_images).latent_dist.sample()
-                lo_res_latents = vae.encode(lo_res_images).latent_dist.sample()
-            # we do conditional flow matching with the low res latents as conditional info
-            # we flow match from noise to hi res latents with lo res latents as cond info
-            x1 = hi_res_latents
-            y = lo_res_latents
-            x0 = torch.randn_like(x1)
-            t, xt, ut = FM.sample_location_and_conditional_flow(x0, x1)
-            # reshape and concat noise
-            cond_img = y.reshape((8, 1, 32, 32))
-            noise = torch.randn((8, 3, 32, 32)).to(device)
-            cond_img = torch.concatenate([cond_img, noise], dim=1)
-
-            lowres_noise_times = torch.zeros(y.shape[0])
-            vt = net_model(x=xt, time=t, cond_images=cond_img, lowres_noise_times=lowres_noise_times)
-            loss = torch.mean((vt - ut) ** 2)
+                # map to 16x16 latent dim
+                z_1 = first_stage_model.encode(x_1).latent_dist.sample().mul_(args.scale_factor)
+                # c = condition = lowres
+                c = first_stage_model.encode(cond).latent_dist.sample().mul_(args.scale_factor)
+            # sample t as batch dim and reshape
+            t = torch.rand((z_1.size(0),), device=device)
+            t = t.view(-1, 1, 1, 1)
+            # z_0 is gaussian we sample from and want to transport to z1
+            # needs to have same dimension as target tensor z1
+            z_0 = torch.randn_like(z_1)
+            # linear interpolation for OT-CMF with added tolerances to avoid edge cases
+            v_t = (1 - t) * z_1 + (1e-5 + (1 - 1e-5) * t) * z_0
+            u = (1 - 1e-5) * z_0 - z_1 # target velocity
+            # bring condition up to shape via simple interpolation
+            c = F.interpolate(c, size=v_t.shape[-2:]).to(device, non_blocking=True)
+            v_t_cond = torch.cat((v_t, c), dim=1)
+            loss = F.mse_loss(model(t.squeeze(), v_t_cond), u)
             loss.backward()
+            optimizer.step()
+            global_step += 1
+            if iteration % 100 == 0:
+                if rank == 0:
+                    print("epoch {} iteration{}, Loss: {}".format(epoch, iteration, loss.item()))
 
-            torch.nn.utils.clip_grad_norm_(net_model.parameters(), FLAGS.grad_clip)  # new
-            optim.step()
-            sched.step()
-            ema(net_model, ema_model, FLAGS.ema_decay)  # new
-            # print(loss.data.cpu().numpy().tolist())
-            if step % 10 == 0:
-                print(loss.data.cpu().numpy().tolist())
-            # sample and Saving the weights
-            if FLAGS.save_step > 0 and step % FLAGS.save_step == 0:
-                # TODO: this does not work yet since we only obtain latents
-                # Need an additional decoding step after generating samples.
-                # Needs to be adjusted in generate samples function aswell.
-                # generate_samples(net_model, FLAGS.parallel, savedir, step, net_="normal")
-                # generate_samples(ema_model, FLAGS.parallel, savedir, step, net_="ema")
+        if not args.no_lr_decay:
+            scheduler.step()
+
+        if rank == 0:
+            with torch.no_grad():
+                rand = torch.randn_like(z_1)[:4]
+                b, h, w = 4, x_1.shape[2], x_1.shape[3]
+                
+                c = first_stage_model.encode(cond).latent_dist.sample().mul_(args.scale_factor)
+                c = F.interpolate(c, size=rand.shape[-2:]).to(device, non_blocking=True)
+                
+                model_cond = WrapperCondFlow(model, c)
+                # sample first then decode with pretrained model
+                fake_sample = sample_from_model(model_cond, rand)[-1]
+                fake_image = first_stage_model.decode(fake_sample / args.scale_factor).sample
+            
+            torchvision.utils.save_image(
+                hires,
+                os.path.join(exp_path, "image_epoch_hires_{}.png".format(epoch)),
+                normalize=True,
+            )
+            torchvision.utils.save_image(
+                fake_image,
+                os.path.join(exp_path, "image_epoch_{}.png".format(epoch)),
+                normalize=True,
+            )
+            del fake_image, fake_sample, model_cond, c
+            if args.save_content:
+                if epoch % args.save_content_every == 0:
+                    print("Saving content.")
+                    content = {
+                        "epoch": epoch + 1,
+                        "global_step": global_step,
+                        "args": args,
+                        "model_dict": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict(),
+                    }
+
+                    torch.save(content, os.path.join(exp_path, "content.pth"))
+
+            if epoch % args.save_ckpt_every == 0:
+                if args.use_ema:
+                    optimizer.swap_parameters_with_ema(store_params_in_ema=True)
+
                 torch.save(
-                    {
-                        "net_model": net_model.state_dict(),
-                        "ema_model": ema_model.state_dict(),
-                        "sched": sched.state_dict(),
-                        "optim": optim.state_dict(),
-                        "step": step,
-                    },
-                    savedir + f"{FLAGS.model}_celeba_weights_step_{step}.pt",
+                    model.state_dict(),
+                    os.path.join(exp_path, "model_{}.pth".format(epoch)),
                 )
+                if args.use_ema:
+                    optimizer.swap_parameters_with_ema(store_params_in_ema=True)
 
 
+def init_processes(rank, size, fn, args):
+    """Initialize the distributed environment."""
+    os.environ["MASTER_ADDR"] = args.master_address
+    os.environ["MASTER_PORT"] = args.master_port
+    torch.cuda.set_device(args.local_rank)
+    gpu = args.local_rank
+    dist.init_process_group(backend="nccl", init_method="env://", rank=rank, world_size=size)
+    fn(rank, gpu, args)
+    dist.barrier()
+    cleanup()
+
+
+def cleanup():
+    dist.destroy_process_group()
+
+
+# %%
 if __name__ == "__main__":
-    app.run(train)
+    parser = argparse.ArgumentParser("ddgan parameters")
+    parser.add_argument("--seed", type=int, default=1024, help="seed used for initialization")
+    parser.add_argument("--resume", action="store_true", default=False)
+    parser.add_argument("--image_size", type=int, default=32, help="size of image")
+    parser.add_argument("--scale_factor", type=float, default=0.18215, help="size of image")
+    parser.add_argument("--num_in_channels", type=int, default=3, help="in channel image")
+    parser.add_argument("--num_out_channels", type=int, default=3, help="in channel image")
+    parser.add_argument("--nf", type=int, default=256, help="channel of image")
+    parser.add_argument("--centered", action="store_false", default=True, help="-1,1 scale")
+    parser.add_argument("--resamp_with_conv", type=bool, default=True)
+    parser.add_argument(
+        "--num_res_blocks",
+        type=int,
+        default=2,
+        help="number of resnet blocks per scale",
+    )
+    parser.add_argument("--num_heads", type=int, default=4, help="number of head")
+    parser.add_argument("--num_head_upsample", type=int, default=-1, help="number of head upsample")
+    parser.add_argument("--num_head_channels", type=int, default=-1, help="number of head channels")
+    parser.add_argument(
+        "--attn_resolutions",
+        nargs="+",
+        type=int,
+        default=(16,),
+        help="resolution of applying attention",
+    )
+    parser.add_argument(
+        "--ch_mult",
+        nargs="+",
+        type=int,
+        default=(1, 1, 2, 2, 4, 4),
+        help="channel mult",
+    )
+    parser.add_argument("--dropout", type=float, default=0.0, help="drop-out rate")
+    parser.add_argument("--num_classes", type=int, default=None, help="num classes")
+    parser.add_argument("--use_scale_shift_norm", type=bool, default=True)
+    parser.add_argument("--resblock_updown", type=bool, default=False)
+    parser.add_argument("--use_new_attention_order", type=bool, default=False)
+    parser.add_argument("--pretrained_autoencoder_ckpt", type=str, default="stabilityai/sd-vae-ft-mse")
+    # geenrator and training
+    parser.add_argument("--exp", default="experiment_cifar_default", help="name of experiment")
+    parser.add_argument("--dataset", default="cifar10", help="name of dataset")
+    parser.add_argument("--num_timesteps", type=int, default=200)
+    parser.add_argument("--batch_size", type=int, default=128, help="input batch size")
+    parser.add_argument("--num_epoch", type=int, default=1200)
+    parser.add_argument("--lr", type=float, default=5e-4, help="learning rate g")
+    parser.add_argument("--beta1", type=float, default=0.5, help="beta1 for adam")
+    parser.add_argument("--beta2", type=float, default=0.9, help="beta2 for adam")
+    parser.add_argument("--no_lr_decay", action="store_true", default=False)
+    parser.add_argument("--use_ema", action="store_true", default=False, help="use EMA or not")
+    parser.add_argument("--ema_decay", type=float, default=0.9999, help="decay rate for EMA")
+    parser.add_argument("--save_content", action="store_true", default=False)
+    parser.add_argument(
+        "--save_content_every",
+        type=int,
+        default=10,
+        help="save content for resuming every x epochs",
+    )
+    parser.add_argument("--save_ckpt_every", type=int, default=25, help="save ckpt every x epochs")
+    # ddp
+    parser.add_argument(
+        "--num_proc_node",
+        type=int,
+        default=1,
+        help="The number of nodes in multi node env.",
+    )
+    parser.add_argument("--num_process_per_node", type=int, default=1, help="number of gpus")
+    parser.add_argument("--node_rank", type=int, default=0, help="The index of node.")
+    parser.add_argument("--local_rank", type=int, default=0, help="rank of process in the node")
+    parser.add_argument("--master_address", type=str, default="127.0.0.1", help="address for master")
+    parser.add_argument("--master_port", type=str, default="6255", help="address for master")
 
-# TODO: Evaluate by passing synthetic hi res latents through decoder
+    # torch.multiprocessing.set_start_method('spawn', force=True)# good solution !!!!
+
+    args = parser.parse_args()
+
+# for debugging
+# args.exp = "superres_kl"
+# args.dataset="celeba_256"
+# args.batch_size=64
+# args.lr=5e-5
+# args.scale_factor=0.18215
+# args.num_epoch=500
+# args.image_size=128
+# args.num_in_channels=8
+# args.num_out_channels=4
+# args.ch_mult=(1, 2, 3, 4)
+# args.attn_resolution=(16, 8)
+# args.num_process_per_node=1
+# args.save_content=True
+
+    args.world_size = args.num_proc_node * args.num_process_per_node
+    size = args.num_process_per_node
+
+    if size > 1:
+        processes = []
+        for rank in range(size):
+            args.local_rank = rank
+            global_rank = rank + args.node_rank * args.num_process_per_node
+            global_size = args.num_proc_node * args.num_process_per_node
+            args.global_rank = global_rank
+            print("Node rank %d, local proc %d, global proc %d" % (args.node_rank, rank, global_rank))
+            p = Process(target=init_processes, args=(global_rank, global_size, train, args))
+            p.start()
+            processes.append(p)
+
+        for p in processes:
+            p.join()
+    else:
+        print("starting in debug mode")
+
+        init_processes(0, size, train, args)
+tents through decoder
