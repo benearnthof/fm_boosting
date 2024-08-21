@@ -27,43 +27,13 @@ from torchdiffeq import odeint_adjoint as odeint
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-
-def copy_source(file, output_dir):
-    shutil.copyfile(file, os.path.join(output_dir, os.path.basename(file)))
-
-
-def get_weight(model):
-    param_size = 0
-    for param in model.parameters():
-        param_size += param.nelement() * param.element_size()
-    buffer_size = 0
-    for buffer in model.buffers():
-        buffer_size += buffer.nelement() * buffer.element_size()
-    size_all_mb = (param_size + buffer_size) / 1024**2
-    return size_all_mb
-
-
-class WrapperCondFlow(nn.Module):
-    def __init__(self, model, cond) -> None:
-        super().__init__()
-        self.model = model
-        self.cond = cond
-    def forward(self, t, x):
-        x = torch.cat([x, self.cond], 1)
-        return self.model(t, x)
-
-
-def broadcast_params(params):
-    for param in params:
-        dist.broadcast(param.data, src=0)
-
-
-def sample_from_model(model, z_0):
-    # how to pass the cond
-    t = torch.tensor([1.0, 0.0], device="cuda")
-    fake_image = odeint(model, z_0, t, atol=1e-8, rtol=1e-8)
-    return fake_image
-
+from fm_boosting.utils import (
+    copy_source,
+    get_weight,
+    WrapperCondFlow,
+    broadcast_params,
+    sample_from_model,
+)
 
 # %%
 def train(rank, gpu, args):
