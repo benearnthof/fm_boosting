@@ -133,7 +133,7 @@ class Unet(Module):
 
         t = self.time_mlp(times)
 
-        h = []
+        h = [] # keep track of residuals while downsampling
 
         for block1, block2, attn, downsample in self.downs:
             x = block1(x, t)
@@ -150,6 +150,7 @@ class Unet(Module):
         x = self.mid_block2(x, t)
 
         for block1, block2, attn, upsample in self.ups:
+            # pop residuals off list while upsampling
             x = torch.cat((x, h.pop()), dim = 1)
             x = block1(x, t)
 
