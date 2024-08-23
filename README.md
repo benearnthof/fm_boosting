@@ -1,4 +1,4 @@
-# fm_boosting (fan repository) [Currently Experimenting with UNet Architectures suitable for conditioning on low-res latents.]
+# fm_boosting (fan repository) [Using the default Unet in /fmboosting/models/unet should work as conditioning is trivial by just concatenating the conditioning image. I'll experiment with adding and concatenation in the coming days, stay tuned!]
 Test Implementation of Boosting Latent Diffusion with Flow Matching
 Please raise issues if you have ideas on how to improve the code, I tried to follow the paper as best as I could but the noise concatenation step still confuses me since it means the tensors will mismatch and thus we will no longer be able to perform flow matching. I solved this by just adding the noise to the source tensor instead of concatenating, but I suspect this may cause the code to perform not quite as good as mixing noise directly with a specialized UNet. 
 
